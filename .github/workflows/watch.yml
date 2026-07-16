@@ -32,6 +32,14 @@ jobs:
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
         run: python scraper.py
 
+      - name: Upload debug artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: debug/
+          if-no-files-found: ignore
+
       - name: Commit updated seen_ids.json
         run: |
           git config user.name "github-actions[bot]"
