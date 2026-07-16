@@ -2,7 +2,7 @@ name: Turbo.az watcher
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # каждые 15 минут — поменяй под себя
+    - cron: "0 * * * *"   # раз в час — под лимит бесплатного плана ScraperAPI
   workflow_dispatch: {}
 
 permissions:
@@ -23,13 +23,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Playwright browsers
-        run: playwright install chromium --with-deps
-
       - name: Run scraper
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
         run: python scraper.py
 
       - name: Upload debug artifacts (on failure)
