@@ -7,7 +7,8 @@
 ВАЖНО: turbo.az закрыт Cloudflare (JS-challenge). Обычный requests.get()
 возвращает 403 даже с headless-браузером внутри GitHub Actions (IP
 датацентра блокируется). Поэтому HTML страницы получаем через ScraperAPI —
-сервис сам решает challenge на своей стороне и отдаёт готовый HTML.
+сервис сам решает challenge на своей стороне (премиум-прокси + JS-рендер)
+и отдаёт готовый HTML.
 """
 
 import os
@@ -53,7 +54,7 @@ def _save_debug_artifact(html, tag):
 def fetch_page_html(retries=2):
     """
     Получает HTML страницы через ScraperAPI — сервис сам решает
-    Cloudflare-challenge на своей стороне (свои прокси + антибот-обход)
+    Cloudflare-challenge на своей стороне (премиум-прокси + JS-рендер)
     и возвращает готовую страницу обычным HTTP-ответом.
     """
     if not SCRAPERAPI_KEY:
@@ -64,6 +65,7 @@ def fetch_page_html(retries=2):
         "api_key": SCRAPERAPI_KEY,
         "url": LISTING_URL,
         "render": "true",
+        "premium": "true",
         "country_code": "us",
     }
 
