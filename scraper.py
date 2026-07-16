@@ -4,9 +4,10 @@
 Каждый запуск: скачивает список последних объявлений, сравнивает
 с уже отправленными (seen_ids.json), новые — шлёт в Telegram-канал.
 
-ВАЖНО: turbo.az закрыт Cloudflare (JS-challenge), поэтому обычный
-requests.get() возвращает 403. Вместо него используется headless-браузер
-Playwright, который реально проходит проверку, как настоящий браузер.
+ВАЖНО: turbo.az закрыт Cloudflare (JS-challenge). Обычный requests.get()
+возвращает 403 даже с headless-браузером внутри GitHub Actions (IP
+датацентра блокируется). Поэтому HTML страницы получаем через ScraperAPI —
+сервис сам решает challenge на своей стороне и отдаёт готовый HTML.
 """
 
 import os
@@ -15,7 +16,6 @@ import json
 import time
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 LISTING_URL = "https://turbo.az/autos"
 SEEN_FILE = "seen_ids.json"
@@ -23,12 +23,9 @@ MAX_PER_RUN = 15
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL = os.environ.get("TELEGRAM_CHANNEL")
+SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
-)
+SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com"
 
 
 def load_seen():
@@ -43,96 +40,49 @@ def save_seen(seen_ids):
         json.dump(sorted(seen_ids), f, ensure_ascii=False)
 
 
-CHALLENGE_MARKERS = (
-    "just a moment",
-    "attention required",
-    "cf-browser-verification",
-    "checking your browser",
-    "cf-challenge",
-)
-
-
-def _looks_like_challenge(page):
-    try:
-        title = (page.title() or "").lower()
-    except Exception:
-        title = ""
-    if any(m in title for m in CHALLENGE_MARKERS):
-        return True
-    try:
-        html_snippet = page.content()[:2000].lower()
-    except Exception:
-        html_snippet = ""
-    return any(m in html_snippet for m in CHALLENGE_MARKERS)
-
-
-def _save_debug_artifacts(page, tag):
-    """Сохраняет скриншот и HTML для диагностики, если что-то пошло не так."""
+def _save_debug_artifact(html, tag):
+    """Сохраняет полученный HTML для диагностики, если что-то пошло не так."""
     os.makedirs("debug", exist_ok=True)
     try:
-        page.screenshot(path=f"debug/{tag}.png", full_page=True)
-    except Exception as e:
-        print("Не удалось сохранить скриншот:", e)
-    try:
         with open(f"debug/{tag}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
+            f.write(html or "")
     except Exception as e:
         print("Не удалось сохранить HTML:", e)
 
 
 def fetch_page_html(retries=2):
     """
-    Открывает LISTING_URL в headless-браузере, ждёт прохождения
-    Cloudflare-проверки и возвращает готовый HTML страницы.
+    Получает HTML страницы через ScraperAPI — сервис сам решает
+    Cloudflare-challenge на своей стороне (свои прокси + антибот-обход)
+    и возвращает готовую страницу обычным HTTP-ответом.
     """
+    if not SCRAPERAPI_KEY:
+        raise SystemExit("Не задан SCRAPERAPI_KEY (проверь GitHub Secrets).")
+
     last_error = None
+    params = {
+        "api_key": SCRAPERAPI_KEY,
+        "url": LISTING_URL,
+        "render": "true",
+        "country_code": "us",
+    }
 
     for attempt in range(1, retries + 2):
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                context = browser.new_context(
-                    user_agent=USER_AGENT,
-                    locale="az-AZ",
-                    viewport={"width": 1366, "height": 900},
-                )
-                page = context.new_page()
+            resp = requests.get(SCRAPERAPI_ENDPOINT, params=params, timeout=90)
+            if not resp.ok:
+                print(f"Попытка {attempt}: статус ScraperAPI {resp.status_code}")
+                print(resp.text[:500])
+                _save_debug_artifact(resp.text, f"error_attempt{attempt}")
+                resp.raise_for_status()
 
-                # маскируем самые очевидные признаки headless/автоматизации
-                page.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-                )
+            html = resp.text
+            if "/autos/" not in html:
+                print(f"Попытка {attempt}: в ответе не найдено ссылок на объявления.")
+                _save_debug_artifact(html, f"noautos_attempt{attempt}")
+                raise RuntimeError("В ответе ScraperAPI не найдено объявлений")
 
-                page.goto(LISTING_URL, wait_until="domcontentloaded", timeout=60000)
-
-                # Ждём прохождения Cloudflare challenge, если он есть,
-                # проверяя каждые 2 секунды до 30 секунд суммарно.
-                waited = 0
-                while _looks_like_challenge(page) and waited < 30:
-                    print(f"Попытка {attempt}: похоже на Cloudflare challenge, жду... ({waited}s)")
-                    page.wait_for_timeout(2000)
-                    waited += 2
-
-                if _looks_like_challenge(page):
-                    print(f"Попытка {attempt}: challenge не прошёл за 30с.")
-                    _save_debug_artifacts(page, f"challenge_attempt{attempt}")
-                    browser.close()
-                    raise RuntimeError("Cloudflare challenge не пройден за отведённое время")
-
-                try:
-                    page.wait_for_selector("a[href^='/autos/']", timeout=20000)
-                except Exception:
-                    print(f"Попытка {attempt}: карточки не появились. Заголовок страницы: {page.title()!r}")
-                    _save_debug_artifacts(page, f"noselector_attempt{attempt}")
-                    browser.close()
-                    raise
-
-                html = page.content()
-                browser.close()
-                return html
+            return html
 
         except Exception as e:
             last_error = e
