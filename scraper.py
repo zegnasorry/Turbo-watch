@@ -3,6 +3,10 @@
 Скрипт мониторинга новых объявлений на turbo.az.
 Каждый запуск: скачивает список последних объявлений, сравнивает
 с уже отправленными (seen_ids.json), новые — шлёт в Telegram-канал.
+
+ВАЖНО: turbo.az закрыт Cloudflare (JS-challenge), поэтому обычный
+requests.get() возвращает 403. Вместо него используется headless-браузер
+Playwright, который реально проходит проверку, как настоящий браузер.
 """
 
 import os
@@ -11,6 +15,7 @@ import json
 import time
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 LISTING_URL = "https://turbo.az/autos"
 SEEN_FILE = "seen_ids.json"
@@ -19,21 +24,11 @@ MAX_PER_RUN = 15
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL = os.environ.get("TELEGRAM_CHANNEL")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-              "image/webp,*/*;q=0.8",
-    "Accept-Language": "az,ru;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-    "Referer": "https://turbo.az/",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
 
 
 def load_seen():
@@ -48,15 +43,59 @@ def save_seen(seen_ids):
         json.dump(sorted(seen_ids), f, ensure_ascii=False)
 
 
+def fetch_page_html(retries=2):
+    """
+    Открывает LISTING_URL в headless-браузере, ждёт прохождения
+    Cloudflare-проверки и возвращает готовый HTML страницы.
+    """
+    last_error = None
+
+    for attempt in range(1, retries + 2):
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    locale="az-AZ",
+                    viewport={"width": 1366, "height": 900},
+                )
+                page = context.new_page()
+
+                # маскируем самые очевидные признаки headless/автоматизации
+                page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
+
+                page.goto(LISTING_URL, wait_until="domcontentloaded", timeout=60000)
+
+                # Если попали на страницу Cloudflare "Just a moment...",
+                # даём ей время пройти challenge автоматически.
+                title = page.title()
+                if "Just a moment" in title or "moment" in title.lower():
+                    print(f"Попытка {attempt}: похоже на Cloudflare challenge, жду...")
+                    page.wait_for_timeout(6000)
+
+                # ждём появления карточек объявлений
+                page.wait_for_selector("a[href^='/autos/']", timeout=20000)
+
+                html = page.content()
+                browser.close()
+                return html
+
+        except Exception as e:
+            last_error = e
+            print(f"Попытка {attempt} не удалась: {e}")
+            time.sleep(3)
+
+    raise last_error
+
+
 def fetch_listings():
-    session = requests.Session()
-    resp = session.get(LISTING_URL, headers=HEADERS, timeout=20)
-    if not resp.ok:
-        print("Статус ответа сайта:", resp.status_code)
-        print("Начало тела ответа (первые 500 символов):")
-        print(resp.text[:500])
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = fetch_page_html()
+    soup = BeautifulSoup(html, "html.parser")
 
     listings = []
     seen_ids_on_page = set()
