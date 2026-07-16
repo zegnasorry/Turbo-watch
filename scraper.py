@@ -4,11 +4,10 @@
 Каждый запуск: скачивает список последних объявлений, сравнивает
 с уже отправленными (seen_ids.json), новые — шлёт в Telegram-канал.
 
-ВАЖНО: turbo.az закрыт Cloudflare (JS-challenge). Обычный requests.get()
-возвращает 403 даже с headless-браузером внутри GitHub Actions (IP
-датацентра блокируется). Поэтому HTML страницы получаем через ScraperAPI —
-сервис сам решает challenge на своей стороне (премиум-прокси + JS-рендер)
-и отдаёт готовый HTML.
+ВАЖНО: turbo.az закрыт Cloudflare (JS-challenge), поэтому обычный
+requests.get() возвращает 403. Вместо него HTML получаем через ScrapingBee
+(mode=auto — сервис сам подбирает минимально необходимый уровень
+обхода защиты и списывает кредиты только за успешный вариант).
 """
 
 import os
@@ -24,9 +23,9 @@ MAX_PER_RUN = 15
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL = os.environ.get("TELEGRAM_CHANNEL")
-SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
+SCRAPINGBEE_API_KEY = os.environ.get("SCRAPINGBEE_API_KEY")
 
-SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com"
+SCRAPINGBEE_ENDPOINT = "https://app.scrapingbee.com/api/v1/"
 
 
 def load_seen():
@@ -53,27 +52,25 @@ def _save_debug_artifact(html, tag):
 
 def fetch_page_html(retries=2):
     """
-    Получает HTML страницы через ScraperAPI — сервис сам решает
-    Cloudflare-challenge на своей стороне (премиум-прокси + JS-рендер)
-    и возвращает готовую страницу обычным HTTP-ответом.
+    Получает HTML страницы через ScrapingBee (mode=auto — сервис сам
+    подбирает самый дешёвый вариант прокси/рендеринга, который реально
+    проходит защиту сайта, и списывает кредиты только за то, что сработало).
     """
-    if not SCRAPERAPI_KEY:
-        raise SystemExit("Не задан SCRAPERAPI_KEY (проверь GitHub Secrets).")
+    if not SCRAPINGBEE_API_KEY:
+        raise SystemExit("Не задан SCRAPINGBEE_API_KEY (проверь GitHub Secrets).")
 
     last_error = None
     params = {
-        "api_key": SCRAPERAPI_KEY,
+        "api_key": SCRAPINGBEE_API_KEY,
         "url": LISTING_URL,
-        "render": "true",
-        "premium": "true",
-        "country_code": "us",
+        "mode": "auto",
     }
 
     for attempt in range(1, retries + 2):
         try:
-            resp = requests.get(SCRAPERAPI_ENDPOINT, params=params, timeout=90)
+            resp = requests.get(SCRAPINGBEE_ENDPOINT, params=params, timeout=90)
             if not resp.ok:
-                print(f"Попытка {attempt}: статус ScraperAPI {resp.status_code}")
+                print(f"Попытка {attempt}: статус ScrapingBee {resp.status_code}")
                 print(resp.text[:500])
                 _save_debug_artifact(resp.text, f"error_attempt{attempt}")
                 resp.raise_for_status()
@@ -82,7 +79,7 @@ def fetch_page_html(retries=2):
             if "/autos/" not in html:
                 print(f"Попытка {attempt}: в ответе не найдено ссылок на объявления.")
                 _save_debug_artifact(html, f"noautos_attempt{attempt}")
-                raise RuntimeError("В ответе ScraperAPI не найдено объявлений")
+                raise RuntimeError("В ответе ScrapingBee не найдено объявлений")
 
             return html
 
