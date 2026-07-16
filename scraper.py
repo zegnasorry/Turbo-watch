@@ -12,8 +12,6 @@ import time
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- НАСТРОЙКИ ----------
-
 LISTING_URL = "https://turbo.az/autos"
 SEEN_FILE = "seen_ids.json"
 MAX_PER_RUN = 15
@@ -24,7 +22,17 @@ CHANNEL = os.environ.get("TELEGRAM_CHANNEL")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0 Safari/537.36"
+                  "Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/webp,*/*;q=0.8",
+    "Accept-Language": "az,ru;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://turbo.az/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
 }
 
 
@@ -41,7 +49,12 @@ def save_seen(seen_ids):
 
 
 def fetch_listings():
-    resp = requests.get(LISTING_URL, headers=HEADERS, timeout=20)
+    session = requests.Session()
+    resp = session.get(LISTING_URL, headers=HEADERS, timeout=20)
+    if not resp.ok:
+        print("Статус ответа сайта:", resp.status_code)
+        print("Начало тела ответа (первые 500 символов):")
+        print(resp.text[:500])
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
