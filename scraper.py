@@ -2,7 +2,8 @@
 """
 Скрипт мониторинга новых объявлений на turbo.az.
 Каждый запуск: скачивает список последних объявлений, сравнивает
-с уже отправленными (seen_ids.json), новые — шлёт в Telegram-канал.
+с уже отправленными (seen_ids.json), новые — шлёт в Telegram-канал,
+сохраняет в Supabase и рассылает лично юзерам, чьи фильтры совпали.
 
 ВАЖНО: turbo.az закрыт Cloudflare (JS-challenge), поэтому обычный
 requests.get() возвращает 403. Вместо него HTML получаем через ScrapingBee
@@ -24,6 +25,9 @@ MAX_PER_RUN = 15
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL = os.environ.get("TELEGRAM_CHANNEL")
 SCRAPINGBEE_API_KEY = os.environ.get("SCRAPINGBEE_API_KEY")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 SCRAPINGBEE_ENDPOINT = "https://app.scrapingbee.com/api/v1/"
 
@@ -91,6 +95,46 @@ def fetch_page_html(retries=2):
     raise last_error
 
 
+def _parse_number(raw):
+    """Достаёт число из строки вида '220 000 km' или '50 000 ₼' -> 220000 / 50000."""
+    if not raw:
+        return None
+    digits = re.sub(r"[^\d]", "", raw)
+    return int(digits) if digits else None
+
+
+def enrich_item(item, card_text):
+    """
+    Достаёт из title/specs/text отдельные поля (бренд, модель, год, пробег,
+    цена как число) — нужны для фильтров и записи в Supabase.
+    Если что-то не распознаётся — оставляем None, не роняем скрипт.
+    """
+    title = item["title"]
+    brand, model = None, None
+    parts = title.split(",")[0].strip().split(" ", 1)
+    if len(parts) == 2:
+        brand, model = parts[0], parts[1]
+    elif len(parts) == 1:
+        brand = parts[0]
+
+    year_match = re.search(r"\b(19[89]\d|20[0-3]\d)\b", card_text)
+    year = int(year_match.group(1)) if year_match else None
+
+    mileage_match = re.search(r"([\d\s]{3,})\s*km", card_text)
+    mileage = _parse_number(mileage_match.group(1)) if mileage_match else None
+
+    price_numeric = _parse_number(item["price"])
+
+    item.update({
+        "brand": brand,
+        "model": model,
+        "year": year,
+        "mileage": mileage,
+        "price_numeric": price_numeric,
+    })
+    return item
+
+
 def fetch_listings():
     html = fetch_page_html()
     soup = BeautifulSoup(html, "html.parser")
@@ -128,18 +172,20 @@ def fetch_listings():
 
         real_link = "https://turbo.az" + a["href"]
 
-        listings.append({
+        item = {
             "id": ad_id,
             "title": title,
             "price": price,
             "specs": specs,
             "link": real_link,
-        })
+        }
+        item = enrich_item(item, text)
+        listings.append(item)
 
     return listings
 
 
-def send_to_telegram(item):
+def send_to_telegram(chat_id, item):
     text = (
         f"🚗 <b>{item['title']}</b>\n"
         f"{item['specs']}\n"
@@ -148,15 +194,96 @@ def send_to_telegram(item):
     )
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": CHANNEL,
+        "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
     r = requests.post(url, data=payload, timeout=20)
     if not r.ok:
-        print("Ошибка отправки в Telegram:", r.status_code, r.text)
+        print("Ошибка отправки в Telegram:", chat_id, r.status_code, r.text)
     return r.ok
+
+
+# ---------------------------------------------------------------------------
+# Supabase: сохранение объявлений + получение юзеров с подходящим фильтром
+# ---------------------------------------------------------------------------
+
+def supabase_configured():
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def _supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def save_listing_to_supabase(item):
+    """Пишет объявление в таблицу listings. Дубликаты (turbo_id) игнорируются."""
+    if not supabase_configured():
+        return
+    url = f"{SUPABASE_URL}/rest/v1/listings"
+    headers = _supabase_headers()
+    headers["Prefer"] = "resolution=ignore-duplicates,return=minimal"
+    payload = {
+        "turbo_id": item["id"],
+        "brand": item.get("brand"),
+        "model": item.get("model"),
+        "year": item.get("year"),
+        "price": item.get("price_numeric"),
+        "mileage": item.get("mileage"),
+        "url": item["link"],
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        if not r.ok:
+            print("Supabase insert error:", r.status_code, r.text)
+    except Exception as e:
+        print("Supabase insert exception:", e)
+
+
+def get_matching_users(item):
+    """
+    Возвращает список user_id, чьи фильтры (users_filters) подходят
+    под данное объявление. Если Supabase не настроен — пустой список
+    (бот просто продолжит работать только через канал).
+    """
+    if not supabase_configured():
+        return []
+    if item.get("price_numeric") is None:
+        return []
+
+    url = f"{SUPABASE_URL}/rest/v1/users_filters"
+    params = {"active": "eq.true", "select": "*"}
+    try:
+        r = requests.get(url, headers=_supabase_headers(), params=params, timeout=20)
+        if not r.ok:
+            print("Supabase filters fetch error:", r.status_code, r.text)
+            return []
+        filters = r.json()
+    except Exception as e:
+        print("Supabase filters fetch exception:", e)
+        return []
+
+    matched = []
+    for f in filters:
+        if f.get("brand") and item.get("brand"):
+            if f["brand"].strip().lower() != item["brand"].strip().lower():
+                continue
+        if f.get("price_min") is not None and item["price_numeric"] < f["price_min"]:
+            continue
+        if f.get("price_max") is not None and item["price_numeric"] > f["price_max"]:
+            continue
+        if f.get("year_min") is not None and (item.get("year") is None or item["year"] < f["year_min"]):
+            continue
+        if f.get("year_max") is not None and (item.get("year") is None or item["year"] > f["year_max"]):
+            continue
+        matched.append(f["user_id"])
+
+    return matched
 
 
 def main():
@@ -176,10 +303,20 @@ def main():
     new_items = list(reversed(new_items))[:MAX_PER_RUN]
 
     for item in new_items:
-        ok = send_to_telegram(item)
+        ok = send_to_telegram(CHANNEL, item)
         if ok:
             seen.add(item["id"])
-            print("Отправлено:", item["title"], item["price"])
+            print("Отправлено в канал:", item["title"], item["price"])
+
+        save_listing_to_supabase(item)
+
+        matched_users = get_matching_users(item)
+        for user_id in matched_users:
+            send_to_telegram(user_id, item)
+            time.sleep(0.5)
+        if matched_users:
+            print(f"  -> персонально отправлено {len(matched_users)} юзерам")
+
         time.sleep(1.5)
 
     if len(seen) > 5000:
