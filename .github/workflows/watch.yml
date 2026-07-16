@@ -2,7 +2,7 @@ name: Turbo.az watcher
 
 on:
   schedule:
-    - cron: "0 * * * *"   # раз в час — под лимит бесплатного плана ScraperAPI
+    - cron: "0 9 * * *"   # раз в сутки — под лимит бесплатного плана (premium+render = 25 кредитов/запрос)
   workflow_dispatch: {}
 
 permissions:
