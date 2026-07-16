@@ -1,9 +1,11 @@
 name: Turbo.az watcher
 
 on:
-  schedule:
-    - cron: "0 9 * * *"   # раз в сутки — под лимит бесплатного плана (premium+render = 25 кредитов/запрос)
   workflow_dispatch: {}
+  # Автоматическое расписание пока отключено — кредиты ScrapingBee разовые.
+  # Когда будешь готов включить обратно, раскомментируй и настрой частоту:
+  # schedule:
+  #   - cron: "0 9 * * *"
 
 permissions:
   contents: write
@@ -27,7 +29,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
         run: python scraper.py
 
       - name: Upload debug artifacts (on failure)
