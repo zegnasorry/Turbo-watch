@@ -43,6 +43,43 @@ def save_seen(seen_ids):
         json.dump(sorted(seen_ids), f, ensure_ascii=False)
 
 
+CHALLENGE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "cf-browser-verification",
+    "checking your browser",
+    "cf-challenge",
+)
+
+
+def _looks_like_challenge(page):
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    if any(m in title for m in CHALLENGE_MARKERS):
+        return True
+    try:
+        html_snippet = page.content()[:2000].lower()
+    except Exception:
+        html_snippet = ""
+    return any(m in html_snippet for m in CHALLENGE_MARKERS)
+
+
+def _save_debug_artifacts(page, tag):
+    """Сохраняет скриншот и HTML для диагностики, если что-то пошло не так."""
+    os.makedirs("debug", exist_ok=True)
+    try:
+        page.screenshot(path=f"debug/{tag}.png", full_page=True)
+    except Exception as e:
+        print("Не удалось сохранить скриншот:", e)
+    try:
+        with open(f"debug/{tag}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+    except Exception as e:
+        print("Не удалось сохранить HTML:", e)
+
+
 def fetch_page_html(retries=2):
     """
     Открывает LISTING_URL в headless-браузере, ждёт прохождения
@@ -71,15 +108,27 @@ def fetch_page_html(retries=2):
 
                 page.goto(LISTING_URL, wait_until="domcontentloaded", timeout=60000)
 
-                # Если попали на страницу Cloudflare "Just a moment...",
-                # даём ей время пройти challenge автоматически.
-                title = page.title()
-                if "Just a moment" in title or "moment" in title.lower():
-                    print(f"Попытка {attempt}: похоже на Cloudflare challenge, жду...")
-                    page.wait_for_timeout(6000)
+                # Ждём прохождения Cloudflare challenge, если он есть,
+                # проверяя каждые 2 секунды до 30 секунд суммарно.
+                waited = 0
+                while _looks_like_challenge(page) and waited < 30:
+                    print(f"Попытка {attempt}: похоже на Cloudflare challenge, жду... ({waited}s)")
+                    page.wait_for_timeout(2000)
+                    waited += 2
 
-                # ждём появления карточек объявлений
-                page.wait_for_selector("a[href^='/autos/']", timeout=20000)
+                if _looks_like_challenge(page):
+                    print(f"Попытка {attempt}: challenge не прошёл за 30с.")
+                    _save_debug_artifacts(page, f"challenge_attempt{attempt}")
+                    browser.close()
+                    raise RuntimeError("Cloudflare challenge не пройден за отведённое время")
+
+                try:
+                    page.wait_for_selector("a[href^='/autos/']", timeout=20000)
+                except Exception:
+                    print(f"Попытка {attempt}: карточки не появились. Заголовок страницы: {page.title()!r}")
+                    _save_debug_artifacts(page, f"noselector_attempt{attempt}")
+                    browser.close()
+                    raise
 
                 html = page.content()
                 browser.close()
